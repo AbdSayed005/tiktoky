@@ -1,151 +1,359 @@
 import streamlit as st
 import yt_dlp
-from PIL import Image
 import requests
+from PIL import Image
 from io import BytesIO
 import os
+import time
+import humanize
+from datetime import datetime
 
-# 🔹 مجلد التنزيلات
+# 🔹 إعداد المجلدات
 DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# 🔹 استخراج بيانات الفيديوهات من TikTok عبر رابط حساب أو فيديو فردي
-def get_tiktok_videos(url):
-    options = {
-        'quiet': True,
-        'extract_flat': True if "tiktok.com/@" in url else False,  # استخراج كل فيديوهات الحساب
-    }
+# 🔹 تهيئة حالة التطبيق
+if 'selected_videos' not in st.session_state:
+    st.session_state.selected_videos = []
+if 'download_history' not in st.session_state:
+    st.session_state.download_history = []
+if 'selected_formats' not in st.session_state:
+    st.session_state.selected_formats = {}
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        try:
+# 🔹 تكوين yt-dlp
+YDL_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'extract_flat': True,
+    'ignoreerrors': True,
+    'no_color': True,
+    'retries': 5,
+    'fragment_retries': 5,
+    'socket_timeout': 30,
+}
+
+def calculate_total_size(videos, selected_formats=None):
+    """حساب الحجم الإجمالي للفيديوهات المحددة"""
+    total_size = 0
+    for video in videos:
+        if selected_formats and video['url'] in selected_formats:
+            # استخدام الجودة المحددة لكل فيديو
+            format_id = selected_formats[video['url']]
+            for fmt in video['formats']:
+                if fmt['format_id'] == format_id:
+                    total_size += fmt['filesize']
+                    break
+        else:
+            # استخدام أعلى جودة متاحة
+            if video['formats']:
+                total_size += video['formats'][0]['filesize']
+    return total_size
+
+# 🔹 استخراج معلومات الفيديو
+@st.cache_data(ttl=3600)
+def get_video_info(url):
+    """استخراج معلومات الفيديو مع معالجة محسنة للأخطاء"""
+    try:
+        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
             info = ydl.extract_info(url, download=False)
+            if not info:
+                st.error("❌ لم يتم العثور على معلومات الفيديو")
+                return None
+                
+            # معالجة قوائم التشغيل
             if 'entries' in info:
-                videos = [
-                    {
-                        'title': entry['title'],
-                        'url': entry['url'],
-                        'thumbnail': entry.get('thumbnail', None),
-                        'filesize': entry.get('filesize', 0)
-                    }
-                    for entry in info['entries'] if 'url' in entry
-                ]
+                videos = []
+                for entry in info['entries']:
+                    if entry:
+                        video_data = extract_video_data(entry['url'])
+                        if video_data:
+                            videos.append(video_data)
                 return videos
-            else:
-                return [{
-                    'title': info.get('title', 'بدون عنوان'),
-                    'url': url,
-                    'thumbnail': info.get('thumbnail', None),
-                    'filesize': info.get('filesize', 0)
-                }]
-        except Exception as e:
-            st.error(f"❌ خطأ أثناء استخراج بيانات الفيديو: {e}")
-            return None
+            
+            # معالجة فيديو منفرد
+            return [extract_video_data(url)]
+            
+    except Exception as e:
+        st.error(f"❌ خطأ في استخراج المعلومات: {str(e)}")
+        return None
 
-# 🔹 تحميل الفيديو باستخدام yt-dlp
-def download_video(video_url, format_id):
-    options = {
-        'format': format_id,
-        'outtmpl': f"{DOWNLOAD_FOLDER}/%(title)s.%(ext)s",
-        'quiet': True,
+def extract_video_data(url):
+    """استخراج بيانات فيديو واحد"""
+    try:
+        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                return None
+
+            # استخراج الجودات المتاحة
+            formats = []
+            for f in info.get('formats', []):
+                if f.get('filesize') and f.get('ext') in ['mp4', 'webm']:
+                    format_info = {
+                        'format_id': f['format_id'],
+                        'ext': f['ext'],
+                        'quality': f.get('format_note', 'N/A'),
+                        'resolution': f.get('resolution', 'N/A'),
+                        'filesize': f.get('filesize', 0),
+                        'filesize_readable': humanize.naturalsize(f.get('filesize', 0)),
+                        'fps': f.get('fps', 0)
+                    }
+                    formats.append(format_info)
+
+            return {
+                'title': info.get('title', 'بدون عنوان'),
+                'url': url,
+                'thumbnail': info.get('thumbnail'),
+                'duration': info.get('duration', 0),
+                'view_count': info.get('view_count', 0),
+                'like_count': info.get('like_count', 0),
+                'formats': sorted(formats, key=lambda x: x['filesize'], reverse=True)
+            }
+    except Exception as e:
+        st.warning(f"⚠️ تعذر استخراج بيانات الفيديو: {str(e)}")
+        return None
+
+# 🔹 تحميل الفيديو
+def download_video(url, format_id, progress_bar=None):
+    """تحميل الفيديو مع عرض التقدم"""
+    try:
+        filename = f"video_{int(time.time())}.mp4"
+        output_path = os.path.join(DOWNLOAD_FOLDER, filename)
+        
+        options = {
+            **YDL_OPTS,
+            'format': format_id,
+            'outtmpl': output_path,
+            'progress_hooks': [
+                lambda d: update_progress(d, progress_bar)
+            ] if progress_bar else []
+        }
+        
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+            return output_path
+    except Exception as e:
+        st.error(f"❌ خطأ في التحميل: {str(e)}")
+        return None
+
+def update_progress(d, progress_bar):
+    """تحديث شريط التقدم"""
+    if d['status'] == 'downloading':
+        total = d.get('total_bytes', 0)
+        downloaded = d.get('downloaded_bytes', 0)
+        if total > 0:
+            progress = (downloaded / total)
+            progress_bar.progress(progress)
+# 🔹 واجهة المستخدم
+st.set_page_config(
+    page_title="Video Downloader",
+    page_icon="🎥",
+    layout="wide"
+)
+
+# التصميم
+st.markdown("""
+<style>
+    .main {
+        padding: 2rem;
     }
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        file_path = f"{DOWNLOAD_FOLDER}/{info['title']}.{info['ext']}"
-        return file_path
-
-# 🔹 عرض الصورة المصغرة
-def show_thumbnail(url):
-    response = requests.get(url)
-    img = Image.open(BytesIO(response.content))
-    st.image(img, caption="📸 الصورة المصغرة", use_container_width=True)
-
-# 🎨 تحسين واجهة Streamlit
-st.markdown("""
-    <style>
-        body {
-            background-color: #f4f4f4;
-            font-family: 'Arial', sans-serif;
-        }
-        .stButton>button {
-            width: 100%;
-            height: 50px;
-            font-size: 18px;
-            border-radius: 10px;
-            background-color: #FF4500;
-            color: white;
-            font-weight: bold;
-            transition: 0.3s;
-        }
-        .stButton>button:hover {
-            background-color: #FF6347;
-        }
-        .footer {
-            position: fixed;
-            bottom: 10px;
-            width: 100%;
-            text-align: center;
-            font-size: 14px;
-            color: gray;
-        }
-    </style>
+    .stButton>button {
+        width: 100%;
+        background-color: #FF0050;
+        color: white;
+        border-radius: 10px;
+        padding: 0.5rem;
+        transition: all 0.3s;
+    }
+    .stButton>button:hover {
+        background-color: #CC0040;
+        transform: translateY(-2px);
+    }
+    .video-info {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+    }
+    .total-size {
+        padding: 1rem;
+        background-color: #e9ecef;
+        border-radius: 10px;
+        margin: 1rem 0;
+    }
+</style>
 """, unsafe_allow_html=True)
 
-st.markdown("""
-    <h1 style='text-align: center; color: #FF4500;'>🎥 تحميل فيديوهات TikTok</h1>
-    <p style='text-align: center; color: gray;'>قم بتحميل فيديوهات TikTok بجودة عالية بسهولة</p>
-""", unsafe_allow_html=True)
+# Sidebar
+with st.sidebar:
+    st.title("⚙️ الإعدادات")
+    
+    # خيارات العرض
+    st.subheader("🎨 خيارات العرض")
+    show_thumbnails = st.toggle("عرض الصور المصغرة", value=True)
+    
+    # إحصائيات
+    st.subheader("📊 إحصائيات")
+    st.write(f"عدد التحميلات: {len(st.session_state.download_history)}")
+    
+    # تنظيف المجلد
+    if st.button("🗑️ تنظيف مجلد التحميلات"):
+        try:
+            for file in os.listdir(DOWNLOAD_FOLDER):
+                file_path = os.path.join(DOWNLOAD_FOLDER, file)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+            st.success("✅ تم تنظيف المجلد بنجاح")
+        except Exception as e:
+            st.error(f"❌ خطأ في التنظيف: {str(e)}")
 
-st.subheader("📌 أدخل رابط حساب TikTok أو فيديو فردي:")
+# الواجهة الرئيسية
+st.title("🎥 تحميل الفيديوهات")
+st.markdown("##### قم بتحميل الفيديوهات من YouTube و TikTok")
 
-url = st.text_input("🎬 رابط الحساب / الفيديو:")
+# إدخال الرابط
+url = st.text_input("🔗 أدخل رابط الفيديو أو قائمة التشغيل:")
 
 if url:
-    video_list = get_tiktok_videos(url)
+    with st.spinner("⏳ جاري تحليل الرابط..."):
+        videos = get_video_info(url)
+        
+        if videos:
+            st.success(f"✅ تم العثور على {len(videos)} فيديو")
+            
+            # زر تحديد الكل
+            select_all = st.checkbox("✅ تحديد الكل")
+            
+            # حساب وعرض الحجم الإجمالي
+            if select_all or st.session_state.selected_videos:
+                total_size = calculate_total_size(
+                    videos if select_all else st.session_state.selected_videos,
+                    st.session_state.selected_formats
+                )
+                st.markdown(f"""
+                <div class='total-size'>
+                    📦 الحجم الإجمالي: {humanize.naturalsize(total_size)}
+                </div>
+                """, unsafe_allow_html=True)
 
-    if video_list:
-        st.success(f"✅ تم العثور على {len(video_list)} فيديو(هات)")
-
-        total_size = sum(v['filesize'] for v in video_list if v['filesize'])
-        st.info(f"📦 **إجمالي حجم الفيديوهات:** {round(total_size / (1024 * 1024), 2) if total_size else 'غير معروف'} MB")
-
-        selected_videos = []
-        for i, video in enumerate(video_list):
-            with st.expander(f"📌 {video['title']}"):
-                col1, col2 = st.columns([1, 3])
-                with col1:
-                    if video['thumbnail']:
-                        show_thumbnail(video['thumbnail'])
-                with col2:
-                    size_mb = round(video['filesize'] / (1024 * 1024), 2) if video['filesize'] else "غير معروف"
-                    st.write(f"📏 **حجم الفيديو:** {size_mb} MB")
-                    if st.checkbox(f"🔽 تحميل هذا الفيديو", key=f"vid_{i}"):
-                        selected_videos.append(video['url'])
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📥 تحميل الفيديوهات المحددة") and selected_videos:
-                with st.spinner("⏳ جاري التحميل..."):
-                    for video_url in selected_videos:
-                        file_path = download_video(video_url, 'best')
-                        if os.path.exists(file_path):
+            # أزرار التحكم الرئيسية
+            control_cols = st.columns([1, 1])
+            with control_cols[0]:
+                if st.button("⬇️ تحميل المحدد", use_container_width=True):
+                    for video in st.session_state.selected_videos:
+                        progress_bar = st.progress(0)
+                        format_id = st.session_state.selected_formats.get(
+                            video['url'],
+                            video['formats'][0]['format_id']
+                        )
+                        file_path = download_video(video['url'], format_id, progress_bar)
+                        if file_path and os.path.exists(file_path):
                             with open(file_path, "rb") as file:
-                                st.download_button(label=f"📂 تحميل {os.path.basename(file_path)}", data=file, file_name=os.path.basename(file_path), mime="video/mp4")
-                    st.success("✅ تم تحميل الفيديوهات بنجاح!")
+                                st.download_button(
+                                    label=f"💾 حفظ {video['title']}",
+                                    data=file,
+                                    file_name=os.path.basename(file_path),
+                                    mime="video/mp4",
+                                    use_container_width=True
+                                )
 
-        with col2:
-            if st.button("📥 تحميل كل الفيديوهات دفعة واحدة"):
-                with st.spinner("⏳ جاري التحميل..."):
-                    for video in video_list:
-                        file_path = download_video(video['url'], 'best')
-                        if os.path.exists(file_path):
+            with control_cols[1]:
+                if st.button("📥 تحميل الكل", use_container_width=True):
+                    for video in videos:
+                        progress_bar = st.progress(0)
+                        format_id = st.session_state.selected_formats.get(
+                            video['url'],
+                            video['formats'][0]['format_id']
+                        )
+                        file_path = download_video(video['url'], format_id, progress_bar)
+                        if file_path and os.path.exists(file_path):
                             with open(file_path, "rb") as file:
-                                st.download_button(label=f"📂 تحميل {os.path.basename(file_path)}", data=file, file_name=os.path.basename(file_path), mime="video/mp4")
-                    st.success("✅ تم تحميل جميع الفيديوهات بنجاح!")
+                                st.download_button(
+                                    label=f"💾 حفظ {video['title']}",
+                                    data=file,
+                                    file_name=os.path.basename(file_path),
+                                    mime="video/mp4",
+                                    use_container_width=True
+                                )
 
-# 🔹 إضافة توقيع المطور
+            # عرض الفيديوهات
+            for i, video in enumerate(videos):
+                if video:
+                    with st.container():
+                        st.markdown("---")
+                        cols = st.columns([1, 2])
+                        
+                        # عرض الصورة المصغرة
+                        with cols[0]:
+                            if show_thumbnails and video['thumbnail']:
+                                try:
+                                    response = requests.get(video['thumbnail'])
+                                    img = Image.open(BytesIO(response.content))
+                                    st.image(img, use_container_width=True)
+                                except:
+                                    st.warning("⚠️ تعذر تحميل الصورة المصغرة")
+                        
+                        # معلومات الفيديو
+                        with cols[1]:
+                            # مربع اختيار التحديد
+                            is_selected = st.checkbox(
+                                "تحديد للتحميل",
+                                key=f"select_{video['url']}",
+                                value=select_all
+                            )
+                            if is_selected and video not in st.session_state.selected_videos:
+                                st.session_state.selected_videos.append(video)
+                            elif not is_selected and video in st.session_state.selected_videos:
+                                st.session_state.selected_videos.remove(video)
+                            
+                            st.subheader(video['title'])
+                            
+                            # إحصائيات
+                            stats_cols = st.columns(3)
+                            with stats_cols[0]:
+                                st.metric("المشاهدات", humanize.intword(video['view_count']))
+                            with stats_cols[1]:
+                                st.metric("الإعجابات", humanize.intword(video['like_count']))
+                            with stats_cols[2]:
+                                duration = time.strftime('%H:%M:%S', time.gmtime(video['duration']))
+                                st.metric("المدة", duration)
+                            
+                            # اختيار الجودة
+                            if video['formats']:
+                                format_options = {
+                                    f"{f['quality']} - {f['resolution']} ({f['filesize_readable']})": f['format_id']
+                                    for f in video['formats']
+                                }
+                                
+                                selected_format = st.selectbox(
+                                    "📊 اختر الجودة:",
+                                    options=list(format_options.keys()),
+                                    key=f"quality_{video['url']}"
+                                )
+                                # حفظ الجودة المحددة
+                                st.session_state.selected_formats[video['url']] = format_options[selected_format]
+                                
+                                # زر تحميل فردي
+                                if st.button("⬇️ تحميل", key=f"download_{video['url']}", use_container_width=True):
+                                    progress_bar = st.progress(0)
+                                    file_path = download_video(
+                                        video['url'],
+                                        format_options[selected_format],
+                                        progress_bar
+                                    )
+                                    if file_path and os.path.exists(file_path):
+                                        with open(file_path, "rb") as file:
+                                            st.download_button(
+                                                label="💾 حفظ الفيديو",
+                                                data=file,
+                                                file_name=os.path.basename(file_path),
+                                                mime="video/mp4",
+                                                use_container_width=True
+                                            )
+
+# Footer
 st.markdown("""
-    <div class='footer'>
-        🚀 تم التطوير بواسطة <b>خباب</b> ❤️
-    </div>
-""", unsafe_allow_html=True)
+<div style='text-align: center; margin-top: 2rem; padding: 1rem; color: gray;'>
+    🚀 تم التطوير بواسطة <b>خباب</b> ❤️
+</div>
+""", unsafe_allow_html=True)            
